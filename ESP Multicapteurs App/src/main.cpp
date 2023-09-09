@@ -4,19 +4,26 @@
 #include <WiFi.h>
 #include <Firebase_ESP_Client.h>
 #include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP085.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "DHTesp.h" // Click here to get the library: http://librarymanager/All#DHTesp
+
+//Include the library
 #include <MQUnifiedsensor.h>
+/************************Hardware Related Macros************************************/
+#define         Board                   ("ESP-32") // Wemos ESP-32 or other board, whatever have ESP32 core.
+#define         Pin                     (25)  //IO25 for your ESP32 WeMos Board, pinout here: https://i.pinimg.com/originals/66/9a/61/669a618d9435c702f4b67e12c40a11b8.jpg
+/***********************Software Related Macros************************************/
+#define         Type                    ("MQ-2") //MQ2 or other MQ Sensor, if change this verify your a and b values.
+#define         Voltage_Resolution      (3.3) // 3V3 <- IMPORTANT. Source: https://randomnerdtutorials.com/esp32-adc-analog-read-arduino-ide/
+#define         ADC_Bit_Resolution      (12) // ESP-32 bit resolution. Source: https://randomnerdtutorials.com/esp32-adc-analog-read-arduino-ide/
+#define         RatioMQ2CleanAir        (60) // Ratio of your sensor, for this example an MQ-3
+/*****************************Globals***********************************************/
+MQUnifiedsensor MQ2(Board, Voltage_Resolution, ADC_Bit_Resolution, Pin, Type);
+/*****************************Globals***********************************************/
 
-//Definitions
-#define placa "Arduino UNO"
-#define Voltage_Resolution 5
-#define pin A4 //Analog input 4 of your arduino
-#define type "MQ-4" //MQ4
-#define ADC_Bit_Resolution 10 // For arduino UNO/MEGA/NANO
-#define RatioMQ4CleanAir 4.4  //RS / R0 = 4.4 ppm 
-//#define calibration_button 13 //Pin to calibrate your sensor
-
-//Declare Sensor
-MQUnifiedsensor MQ4(placa, Voltage_Resolution, ADC_Bit_Resolution, pin, type);
 
 // Provide the token generation process info.
 #include "addons/TokenHelper.h"
@@ -37,6 +44,8 @@ MQUnifiedsensor MQ4(placa, Voltage_Resolution, ADC_Bit_Resolution, pin, type);
 // Insert RTDB URLefine the RTDB URL
 #define DATABASE_URL "https://esp-multicapteur-app-default-rtdb.europe-west1.firebasedatabase.app/"
 
+DHTesp dht;
+
 // Define Firebase objects
 FirebaseData stream;
 FirebaseData fbdo;
@@ -49,36 +58,33 @@ String uid;
 // Variables to save database paths
 // Database main path (to be updated in setup with the user UID)
 String databasePath;
-
 // Database child nodes
 String tempPath = "/temperature";
 String humPath = "/humidity";
 String smokePath = "/smoke";
-String presistorPath = "/presistor";
 String timePath = "/timestamp/.sv";
 
 // Path to listen for changes
 String listenerPath;
 
 // Sensor path (where we'll save our readings)
-String sensordhtPath;
-String sensorsmokePath;
-String sensorlightPath;
+String sensorPath;
+String sensorDHTPath;
+String sensorSmokePath;
 
 // JSON object to save sensor readings and timestamp
 FirebaseJson json;
 
-// dht sensor
+//DHT11 Sensor
+DHTesp dht;
 float temperature;
 float humidity;
 
-// smoke sensor
-float smoke;
+//OLED Display
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
 
-
-// light sensor
-float presistor;
-
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 // Timer variables (send new readings every other minute)
 unsigned long sendDataPrevMillis = 0;
@@ -99,12 +105,81 @@ const int slider1Channel = 0;
 const int slider2Channel = 1;
 const int resolution = 8;
 
-// Initialize dht
-void initdht(){
-  if (!bmp.begin(0x76)) {
-    Serial.println("Could not find a valid BMP180 sensor, check wiring!");
-    while (1);
+
+//initialize DHT
+void initDHT(){
+  dht.setup(17, DHTesp::DHT11); // Connect DHT sensor to GPIO 17
+  delay(dht.getMinimumSamplingPeriod());
+
+  float humidity = dht.getHumidity();
+  float temperature = dht.getTemperature();
+
+  Serial.print(dht.getStatusString());
+  Serial.print("\t");
+  Serial.print(humidity, 1);
+  Serial.print("\t\t");
+  Serial.print(temperature, 1);
+  Serial.print("\t\t");
+  Serial.print(dht.toFahrenheit(temperature), 1);
+  Serial.print("\t\t");
+  Serial.print(dht.computeHeatIndex(temperature, humidity, false), 1);
+  Serial.print("\t\t");
+  Serial.println(dht.computeHeatIndex(dht.toFahrenheit(temperature), humidity, true), 1);
+  delay(2000);
+}
+// Initialize MQ2
+void initMQ(){
+    //Set math model to calculate the PPM concentration and the value of constants
+  MQ2.setRegressionMethod(1); //_PPM =  a*ratio^b
+  MQ2.setA(521853); MQ2.setB(-3.821); // Configure the equation to to calculate Benzene concentration
+  /*
+    Exponential regression:
+  Gas    | a      | b
+  LPG    | 44771  | -3.245
+  CH4    | 2*10^31| 19.01
+  CO     | 521853 | -3.821
+  Alcohol| 0.3934 | -1.504
+  Benzene| 4.8387 | -2.68
+  Hexane | 7585.3 | -2.849
+  */
+
+  /*****************************  MQ Init ********************************************/ 
+  //Remarks: Configure the pin of arduino as input.
+  /************************************************************************************/ 
+  MQ2.init(); 
+ 
+  /* 
+    //If the RL value is different from 10K please assign your RL value with the following method:
+    MQ2.setRL(10);
+  */
+  /*****************************  MQ CAlibration ********************************************/ 
+  // Explanation: 
+   // In this routine the sensor will measure the resistance of the sensor supposedly before being pre-heated
+  // and on clean air (Calibration conditions), setting up R0 value.
+  // We recomend executing this routine only on setup in laboratory conditions.
+  // This routine does not need to be executed on each restart, you can load your R0 value from eeprom.
+  // Acknowledgements: https://jayconsystems.com/blog/understanding-a-gas-sensor
+  Serial.print("Calibrating please wait.");
+  float calcR0 = 0;
+  for(int i = 1; i<=10; i ++)
+  {
+    MQ2.update(); // Update data, the arduino will read the voltage from the analog pin
+    calcR0 += MQ2.calibrate(RatioMQ2CleanAir);
+    Serial.print(".");
   }
+  MQ2.setR0(calcR0/10);
+  Serial.println("  done!.");
+  
+  if(isinf(calcR0)) {Serial.println("Warning: Conection issue, R0 is infinite (Open circuit detected) please check your wiring and supply"); while(1);}
+  if(calcR0 == 0){Serial.println("Warning: Conection issue found, R0 is zero (Analog pin shorts to ground) please check your wiring and supply"); while(1);}
+  /*****************************  MQ CAlibration ********************************************/ 
+  MQ2.serialDebug(true);
+
+  MQ2.update(); // Update data, the arduino will read the voltage from the analog pin
+  MQ2.readSensor(); // Sensor will read PPM concentration using the model, a and b values set previously or from the setup
+  MQ2.serialDebug(); // Will print the table on the serial port
+  delay(500); //Sampling frequency
+
 }
 // Initialize OLED
 void initOLED(){
@@ -258,7 +333,8 @@ void setup(){
   Serial.begin(115200);
 
   // Init BME sensor, OLED, and WiFi
-  initBMP();
+  initDHT();
+  initMQ();
   initOLED();
   initWiFi();
 
@@ -313,8 +389,10 @@ void setup(){
   // Update database path for listening
   listenerPath = databasePath + "/outputs/";
 
-  //Update database path for sensor readings
+  //Update database path for sensors readings
   sensorPath = databasePath +"/sensor/";
+  sensorDHTPath = databasePath +"/sensorDHT/";
+  sensorSmokePath = databasePath +"/sensorSmoke/";
 
   // Streaming (whenever data changes on a path)
   // Begin stream on a database path --> UsersData/<user_uid>/outputs
@@ -332,10 +410,17 @@ void loop(){
   if (Firebase.ready() && (millis() - sendDataPrevMillis > timerDelay || sendDataPrevMillis == 0)){
     sendDataPrevMillis = millis();
     
-    json.set(tempPath.c_str(), String(bmp.readTemperature()));
-    json.set(humPath.c_str(), String(bmp.readAltitude()));
-    json.set(presPath.c_str(), String(bmp.readPressure()/100.0F));
+    /*json.set(tempPath.c_str(), String(bmp.readTemperature()));
+    json.set(humPath.c_str(), String(bmp.readAltitude()));*/
+
+    json.set(humPath.c_str(), String(dht.getHumidity()));
+
+    json.set(tempPath.c_str(), String(dht.getTemperature()));
+
+    json.set(smokePath.c_str(), String(MQ2.readSensor()));
+
     json.set(timePath, "timestamp");
+  
 
     Serial.printf("Set json... %s\n", Firebase.RTDB.pushJSON(&fbdo, sensorPath.c_str(), &json) ? "ok" : fbdo.errorReason().c_str());
 
